@@ -1,0 +1,232 @@
+--- a/app/src/main/kotlin/com/bydmate/app/data/vehicle/WindowChannelStore.kt
++++ b/app/src/main/kotlin/com/bydmate/app/data/vehicle/WindowChannelStore.kt
+@@ -6,12 +6,28 @@
+ /** Remembered window write-channel generation for this head unit. */
+ enum class WindowChannel { UNKNOWN, PERCENT, CTRL }
+ 
++/**
++ * Manual, user-set channel for firmwares the auto-probe gets wrong. AUTO = probe as before.
++ * PERCENT forces every window write onto the TARGET_POSITION fids — and reroutes open/close
++ * to a position write — for units whose CTRL open/close fid is dead (#64, e.g. the DiLink 3.0
++ * "trinket"/Destroyer 05, where only percent moves the glass). CTRL forces the opposite.
++ */
++enum class WindowChannelOverride { AUTO, PERCENT, CTRL }
++
+ /** Persists which window channel this firmware generation actually exposes. */
+ interface WindowChannelStore {
+     fun winner(): WindowChannel
+     fun setWinner(channel: WindowChannel)
+ 
+     /**
++     * User-set channel override. Default AUTO (and a no-op setter) so existing anonymous
++     * implementations — the test fakes — keep compiling without change; only the real
++     * prefs-backed store persists it.
++     */
++    fun override(): WindowChannelOverride = WindowChannelOverride.AUTO
++    fun setOverride(value: WindowChannelOverride) {}
++
++    /**
+      * When the first probe saw the "no percent family" signature, in wall-clock millis
+      * (0 = no pending candidate). CTRL is only fixed by a SECOND such probe far enough
+      * away in time, so neither a single cold-start link error nor a burst of them inside
+@@ -39,6 +55,20 @@
+             .putString(KEY_WINNER, channel.name).putLong(KEY_CANDIDATE_TS, 0L).apply()
+     }
+ 
++    // The override is a deliberate user choice, so it lives OUTSIDE guardsPass(): an OTA
++    // (fingerprint change) or a schema bump must not silently revert it the way it resets
++    // an auto-probed winner.
++    override fun override(): WindowChannelOverride =
++        runCatching {
++            WindowChannelOverride.valueOf(
++                prefs.getString(KEY_OVERRIDE, null) ?: return WindowChannelOverride.AUTO
++            )
++        }.getOrDefault(WindowChannelOverride.AUTO)
++
++    override fun setOverride(value: WindowChannelOverride) {
++        prefs.edit().putString(KEY_OVERRIDE, value.name).apply()
++    }
++
+     override fun ctrlCandidateAtMs(): Long = if (guardsPass()) prefs.getLong(KEY_CANDIDATE_TS, 0L) else 0L
+ 
+     override fun setCtrlCandidateAtMs(ts: Long) {
+@@ -65,5 +95,6 @@
+         private const val KEY_WINNER = "window_channel_winner"
+         private const val KEY_FP = "window_channel_fp"
+         private const val KEY_CANDIDATE_TS = "window_channel_ctrl_candidate_ts"
++        private const val KEY_OVERRIDE = "window_channel_override"
+     }
+ }
+--- a/app/src/main/kotlin/com/bydmate/app/data/vehicle/WindowChannelRouter.kt
++++ b/app/src/main/kotlin/com/bydmate/app/data/vehicle/WindowChannelRouter.kt
+@@ -54,7 +54,18 @@
+      * unchanged for every non-window action and for percent-capable / undecided units.
+      */
+     suspend fun route(actionName: String, value: Int): RoutedWrite {
+-        val ctrlAction = CTRL_ACTIONS[actionName.lowercase()]
++        val key = actionName.lowercase()
++
++        // Forced PERCENT: the car's CTRL open/close fid is dead (#64, e.g. DiLink 3.0
++        // "trinket"/Destroyer 05 — only TARGET_POSITION moves the glass). Send open/close
++        // as a position write instead. Gated on the explicit user override, NOT on an AUTO
++        // probe that merely latched PERCENT, so the default behaviour of every other unit
++        // (where the CTRL open/close fid works) is left byte-for-byte unchanged.
++        if (store.override() == WindowChannelOverride.PERCENT) {
++            POS_ACTIONS[key]?.let { (posAction, percent) -> return RoutedWrite(posAction, percent) }
++        }
++
++        val ctrlAction = CTRL_ACTIONS[key]
+             ?: return RoutedWrite(actionName, value)
+         // Out-of-range percent keeps the percent action so the allowlist range gate
+         // rejects it, instead of being folded into a valid CTRL code.
+@@ -78,8 +89,16 @@
+         }
+     }
+ 
+-    /** Persisted winner, else a fresh enough probe verdict (UNKNOWN included). */
++    /** A user override pins the channel outright and skips every probe. */
++    private fun forcedChannel(): WindowChannel? = when (store.override()) {
++        WindowChannelOverride.PERCENT -> WindowChannel.PERCENT
++        WindowChannelOverride.CTRL -> WindowChannel.CTRL
++        WindowChannelOverride.AUTO -> null
++    }
++
++    /** Override, else persisted winner, else a fresh enough probe verdict (UNKNOWN included). */
+     private fun decided(): WindowChannel? {
++        forcedChannel()?.let { return it }
+         store.winner().takeIf { it != WindowChannel.UNKNOWN }?.let { return it }
+         return memo?.takeIf { clock() - it.atMs < MEMO_TTL_MS }?.channel
+     }
+@@ -176,6 +195,23 @@
+             "window_rear_right_pos" to "window_rear_right_ctrl",
+         )
+ 
++        /**
++         * Reverse of the CTRL path, for the forced-PERCENT override: an open/close action
++         * (its CTRL fid is dead on this firmware) becomes a TARGET_POSITION write — open =
++         * 100 (fully down), close = 0 (fully up). Only open/close are remapped; an explicit
++         * "to 30%" already arrives as a *_pos action and needs no rerouting.
++         */
++        private val POS_ACTIONS: Map<String, Pair<String, Int>> = mapOf(
++            "window_driver_open" to ("window_driver_pos" to 100),
++            "window_driver_close" to ("window_driver_pos" to 0),
++            "window_passenger_open" to ("window_passenger_pos" to 100),
++            "window_passenger_close" to ("window_passenger_pos" to 0),
++            "window_rear_left_open" to ("window_rear_left_pos" to 100),
++            "window_rear_left_close" to ("window_rear_left_pos" to 0),
++            "window_rear_right_open" to ("window_rear_right_pos" to 100),
++            "window_rear_right_close" to ("window_rear_right_pos" to 0),
++        )
++
+         private const val CTRL_OPEN = 1
+         private const val CTRL_CLOSE = 2
+         private const val CTRL_HALF = 4
+--- a/app/src/main/kotlin/com/bydmate/app/ui/settings/SettingsViewModel.kt
++++ b/app/src/main/kotlin/com/bydmate/app/ui/settings/SettingsViewModel.kt
+@@ -395,6 +395,18 @@
+     )
+     val agentPersona: StateFlow<String> = _agentPersona.asStateFlow()
+ 
++    // Manual window write-channel override (see WindowChannelRouter). AUTO for every car the
++    // auto-probe gets right; PERCENT for firmwares whose CTRL open/close fid is dead (#64).
++    private val _windowChannelOverride =
++        MutableStateFlow(windowChannelStore.override())
++    val windowChannelOverride: StateFlow<com.bydmate.app.data.vehicle.WindowChannelOverride> =
++        _windowChannelOverride.asStateFlow()
++
++    fun setWindowChannelOverride(value: com.bydmate.app.data.vehicle.WindowChannelOverride) {
++        windowChannelStore.setOverride(value)
++        _windowChannelOverride.value = value
++    }
++
+     /** MainActivity listens to the same prefs file and re-provides the density on change. */
+     fun setFontScale(scale: Float) {
+         localePreferences.setFontScale(scale)
+--- a/app/src/main/kotlin/com/bydmate/app/ui/settings/SettingsScreen.kt
++++ b/app/src/main/kotlin/com/bydmate/app/ui/settings/SettingsScreen.kt
+@@ -2523,6 +2523,23 @@
+             text = state.fidDumpStatus!!,
+         )
+     }
++    SettingDivider()
++    // Window write-channel override (#64). "Проценты" sends open/close as TARGET_POSITION
++    // writes, for firmwares (DiLink 3.0 "trinket"/Destroyer 05) whose CTRL open/close fid is
++    // dead. Plain strings instead of stringResource so no new strings.xml entry is required.
++    val windowOverride by viewModel.windowChannelOverride.collectAsStateWithLifecycle()
++    val windowOverrideOptions = listOf(
++        com.bydmate.app.data.vehicle.WindowChannelOverride.AUTO,
++        com.bydmate.app.data.vehicle.WindowChannelOverride.PERCENT,
++        com.bydmate.app.data.vehicle.WindowChannelOverride.CTRL,
++    )
++    SettingChipRow(
++        title = "Канал окон",
++        description = "Как слать команды окнам. «Проценты» — если open/close не двигает стекло (DiLink 3.0).",
++        options = listOf("Авто", "Проценты", "CTRL"),
++        selectedIndex = windowOverrideOptions.indexOf(windowOverride).coerceAtLeast(0),
++        onSelect = { idx -> viewModel.setWindowChannelOverride(windowOverrideOptions[idx]) },
++    )
+ }
+ 
+ /** «Проверка HUD»: about 90 s of test hints on the glass; the recorded log and a video of the
+--- a/app/src/test/kotlin/com/bydmate/app/data/vehicle/WindowChannelOverrideTest.kt
++++ b/app/src/test/kotlin/com/bydmate/app/data/vehicle/WindowChannelOverrideTest.kt
+@@ -0,0 +1,59 @@
++package com.bydmate.app.data.vehicle
++
++import io.mockk.mockk
++import kotlinx.coroutines.test.runTest
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++/**
++ * The manual PERCENT override (#64): on firmwares whose CTRL open/close window fid is dead
++ * (DiLink 3.0 "trinket" / Destroyer 05, where only TARGET_POSITION moves the glass), the
++ * override reroutes open/close to a position write — open = 100, close = 0 — and leaves an
++ * explicit percentage untouched. AUTO must keep the pre-existing behaviour unchanged, and the
++ * override must pin the channel without ever reading the bus.
++ */
++class WindowChannelOverrideTest {
++
++    private class OverrideStore(private val value: WindowChannelOverride) : WindowChannelStore {
++        override fun winner() = WindowChannel.UNKNOWN
++        override fun setWinner(channel: WindowChannel) {}
++        override fun ctrlCandidateAtMs() = 0L
++        override fun setCtrlCandidateAtMs(ts: Long) {}
++        override fun override() = value
++    }
++
++    /** Fails the test if the router ever touches the bus — a forced channel must not probe. */
++    private class NoReadHelper : HelperClient by mockk(relaxed = true) {
++        override suspend fun read(dev: Int, fid: Int, tx: Int): Long? =
++            throw AssertionError("forced override must not probe (read dev=$dev fid=$fid)")
++    }
++
++    private fun router(store: WindowChannelStore) =
++        WindowChannelRouter(NoReadHelper(), store) { 1_700_000_000_000L }
++
++    @Test fun `forced PERCENT reroutes driver open to a full-down position write`() = runTest {
++        val routed = router(OverrideStore(WindowChannelOverride.PERCENT))
++            .route("window_driver_open", 1)
++        assertEquals(RoutedWrite("window_driver_pos", 100), routed)
++    }
++
++    @Test fun `forced PERCENT reroutes driver close to a full-up position write`() = runTest {
++        val routed = router(OverrideStore(WindowChannelOverride.PERCENT))
++            .route("window_driver_close", 2)
++        assertEquals(RoutedWrite("window_driver_pos", 0), routed)
++    }
++
++    @Test fun `forced PERCENT leaves an explicit percentage untouched`() = runTest {
++        val routed = router(OverrideStore(WindowChannelOverride.PERCENT))
++            .route("window_driver_pos", 30)
++        assertEquals(RoutedWrite("window_driver_pos", 30), routed)
++    }
++
++    @Test fun `AUTO leaves open or close as the native CTRL action, as before`() = runTest {
++        // AUTO must not reach the rerouting path at all; open/close pass straight through
++        // (they are not percent actions, so the router returns them verbatim without probing).
++        val routed = router(OverrideStore(WindowChannelOverride.AUTO))
++            .route("window_driver_open", 1)
++        assertEquals(RoutedWrite("window_driver_open", 1), routed)
++    }
++}
