@@ -395,6 +395,18 @@ class SettingsViewModel @Inject @Suppress("LongParameterList") constructor( // H
     )
     val agentPersona: StateFlow<String> = _agentPersona.asStateFlow()
 
+    // Manual window write-channel override (see WindowChannelRouter). AUTO for every car the
+    // auto-probe gets right; PERCENT for firmwares whose CTRL open/close fid is dead (#64).
+    private val _windowChannelOverride =
+        MutableStateFlow(windowChannelStore.override())
+    val windowChannelOverride: StateFlow<com.bydmate.app.data.vehicle.WindowChannelOverride> =
+        _windowChannelOverride.asStateFlow()
+
+    fun setWindowChannelOverride(value: com.bydmate.app.data.vehicle.WindowChannelOverride) {
+        windowChannelStore.setOverride(value)
+        _windowChannelOverride.value = value
+    }
+
     /** MainActivity listens to the same prefs file and re-provides the density on change. */
     fun setFontScale(scale: Float) {
         localePreferences.setFontScale(scale)

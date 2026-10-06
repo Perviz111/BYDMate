@@ -6,10 +6,26 @@ import android.os.Build
 /** Remembered window write-channel generation for this head unit. */
 enum class WindowChannel { UNKNOWN, PERCENT, CTRL }
 
+/**
+ * Manual, user-set channel for firmwares the auto-probe gets wrong. AUTO = probe as before.
+ * PERCENT forces every window write onto the TARGET_POSITION fids — and reroutes open/close
+ * to a position write — for units whose CTRL open/close fid is dead (#64, e.g. the DiLink 3.0
+ * "trinket"/Destroyer 05, where only percent moves the glass). CTRL forces the opposite.
+ */
+enum class WindowChannelOverride { AUTO, PERCENT, CTRL }
+
 /** Persists which window channel this firmware generation actually exposes. */
 interface WindowChannelStore {
     fun winner(): WindowChannel
     fun setWinner(channel: WindowChannel)
+
+    /**
+     * User-set channel override. Default AUTO (and a no-op setter) so existing anonymous
+     * implementations — the test fakes — keep compiling without change; only the real
+     * prefs-backed store persists it.
+     */
+    fun override(): WindowChannelOverride = WindowChannelOverride.AUTO
+    fun setOverride(value: WindowChannelOverride) {}
 
     /**
      * When the first probe saw the "no percent family" signature, in wall-clock millis
@@ -39,6 +55,20 @@ class WindowChannelStorePrefs(private val prefs: SharedPreferences) : WindowChan
             .putString(KEY_WINNER, channel.name).putLong(KEY_CANDIDATE_TS, 0L).apply()
     }
 
+    // The override is a deliberate user choice, so it lives OUTSIDE guardsPass(): an OTA
+    // (fingerprint change) or a schema bump must not silently revert it the way it resets
+    // an auto-probed winner.
+    override fun override(): WindowChannelOverride =
+        runCatching {
+            WindowChannelOverride.valueOf(
+                prefs.getString(KEY_OVERRIDE, null) ?: return WindowChannelOverride.AUTO
+            )
+        }.getOrDefault(WindowChannelOverride.AUTO)
+
+    override fun setOverride(value: WindowChannelOverride) {
+        prefs.edit().putString(KEY_OVERRIDE, value.name).apply()
+    }
+
     override fun ctrlCandidateAtMs(): Long = if (guardsPass()) prefs.getLong(KEY_CANDIDATE_TS, 0L) else 0L
 
     override fun setCtrlCandidateAtMs(ts: Long) {
@@ -65,5 +95,6 @@ class WindowChannelStorePrefs(private val prefs: SharedPreferences) : WindowChan
         private const val KEY_WINNER = "window_channel_winner"
         private const val KEY_FP = "window_channel_fp"
         private const val KEY_CANDIDATE_TS = "window_channel_ctrl_candidate_ts"
+        private const val KEY_OVERRIDE = "window_channel_override"
     }
 }

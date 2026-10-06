@@ -2523,6 +2523,23 @@ private fun DiagnosticsRows(state: SettingsUiState, viewModel: SettingsViewModel
             text = state.fidDumpStatus!!,
         )
     }
+    SettingDivider()
+    // Window write-channel override (#64). "Проценты" sends open/close as TARGET_POSITION
+    // writes, for firmwares (DiLink 3.0 "trinket"/Destroyer 05) whose CTRL open/close fid is
+    // dead. Plain strings instead of stringResource so no new strings.xml entry is required.
+    val windowOverride by viewModel.windowChannelOverride.collectAsStateWithLifecycle()
+    val windowOverrideOptions = listOf(
+        com.bydmate.app.data.vehicle.WindowChannelOverride.AUTO,
+        com.bydmate.app.data.vehicle.WindowChannelOverride.PERCENT,
+        com.bydmate.app.data.vehicle.WindowChannelOverride.CTRL,
+    )
+    SettingChipRow(
+        title = "Канал окон",
+        description = "Как слать команды окнам. «Проценты» — если open/close не двигает стекло (DiLink 3.0).",
+        options = listOf("Авто", "Проценты", "CTRL"),
+        selectedIndex = windowOverrideOptions.indexOf(windowOverride).coerceAtLeast(0),
+        onSelect = { idx -> viewModel.setWindowChannelOverride(windowOverrideOptions[idx]) },
+    )
 }
 
 /** «Проверка HUD»: about 90 s of test hints on the glass; the recorded log and a video of the

@@ -54,7 +54,18 @@ class WindowChannelRouter(
      * unchanged for every non-window action and for percent-capable / undecided units.
      */
     suspend fun route(actionName: String, value: Int): RoutedWrite {
-        val ctrlAction = CTRL_ACTIONS[actionName.lowercase()]
+        val key = actionName.lowercase()
+
+        // Forced PERCENT: the car's CTRL open/close fid is dead (#64, e.g. DiLink 3.0
+        // "trinket"/Destroyer 05 — only TARGET_POSITION moves the glass). Send open/close
+        // as a position write instead. Gated on the explicit user override, NOT on an AUTO
+        // probe that merely latched PERCENT, so the default behaviour of every other unit
+        // (where the CTRL open/close fid works) is left byte-for-byte unchanged.
+        if (store.override() == WindowChannelOverride.PERCENT) {
+            POS_ACTIONS[key]?.let { (posAction, percent) -> return RoutedWrite(posAction, percent) }
+        }
+
+        val ctrlAction = CTRL_ACTIONS[key]
             ?: return RoutedWrite(actionName, value)
         // Out-of-range percent keeps the percent action so the allowlist range gate
         // rejects it, instead of being folded into a valid CTRL code.
@@ -78,8 +89,16 @@ class WindowChannelRouter(
         }
     }
 
-    /** Persisted winner, else a fresh enough probe verdict (UNKNOWN included). */
+    /** A user override pins the channel outright and skips every probe. */
+    private fun forcedChannel(): WindowChannel? = when (store.override()) {
+        WindowChannelOverride.PERCENT -> WindowChannel.PERCENT
+        WindowChannelOverride.CTRL -> WindowChannel.CTRL
+        WindowChannelOverride.AUTO -> null
+    }
+
+    /** Override, else persisted winner, else a fresh enough probe verdict (UNKNOWN included). */
     private fun decided(): WindowChannel? {
+        forcedChannel()?.let { return it }
         store.winner().takeIf { it != WindowChannel.UNKNOWN }?.let { return it }
         return memo?.takeIf { clock() - it.atMs < MEMO_TTL_MS }?.channel
     }
@@ -174,6 +193,23 @@ class WindowChannelRouter(
             "window_passenger_pos" to "window_passenger_ctrl",
             "window_rear_left_pos" to "window_rear_left_ctrl",
             "window_rear_right_pos" to "window_rear_right_ctrl",
+        )
+
+        /**
+         * Reverse of the CTRL path, for the forced-PERCENT override: an open/close action
+         * (its CTRL fid is dead on this firmware) becomes a TARGET_POSITION write — open =
+         * 100 (fully down), close = 0 (fully up). Only open/close are remapped; an explicit
+         * "to 30%" already arrives as a *_pos action and needs no rerouting.
+         */
+        private val POS_ACTIONS: Map<String, Pair<String, Int>> = mapOf(
+            "window_driver_open" to ("window_driver_pos" to 100),
+            "window_driver_close" to ("window_driver_pos" to 0),
+            "window_passenger_open" to ("window_passenger_pos" to 100),
+            "window_passenger_close" to ("window_passenger_pos" to 0),
+            "window_rear_left_open" to ("window_rear_left_pos" to 100),
+            "window_rear_left_close" to ("window_rear_left_pos" to 0),
+            "window_rear_right_open" to ("window_rear_right_pos" to 100),
+            "window_rear_right_close" to ("window_rear_right_pos" to 0),
         )
 
         private const val CTRL_OPEN = 1
